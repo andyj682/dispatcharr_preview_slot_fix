@@ -1,0 +1,24 @@
+{
+  "name": "Preview Slot Fix",
+  "version": "1.0.0",
+  "description": "Stops a stream preview from freeing the provider connection of a channel that is still playing, which can otherwise hand that provider to the next channel that starts.",
+  "author": "andyj682",
+  "help_url": "https://github.com/andyj682/dispatcharr_preview_slot_fix",
+  "fields": [
+    {
+      "id": "_info",
+      "label": "",
+      "type": "info",
+      "description": "No settings needed. Enable the plugin, then restart the Dispatcharr container. Previews keep working as before; they just keep their own connection record instead of sharing one with live channels."
+    }
+  ],
+  "actions": [
+    {
+      "id": "status",
+      "label": "Show status",
+      "description": "Report whether the fix is active and list the preview connections it is currently holding.",
+      "button_label": "Check status",
+      "button_variant": "outline"
+    }
+  ]
+}
