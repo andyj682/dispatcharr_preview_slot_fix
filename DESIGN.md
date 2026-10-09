@@ -1,7 +1,8 @@
 # Design notes
 
 Why this plugin is built the way it is. Written against Dispatcharr **0.31.0**,
-cross-checked against upstream `dev`.
+updated for **0.32.0** (plugin 1.1.0). The bug is reported upstream as
+[Dispatcharr#1773](https://github.com/Dispatcharr/Dispatcharr/issues/1773).
 
 ## The collision
 
@@ -25,6 +26,21 @@ exit, so its counter can no longer move.
 namespace keyed by channel id — so previewing stream N overwrites channel N's
 record.
 
+### What 0.32.0 changed, and didn't
+
+0.32.0 added **profile-scoped** previews: `get_stream(preferred_profile_id=N)`,
+`release_stream(m3u_profile_id=N)`, worker id `{stream_hash}.p{N}`, keyed
+`stream_profile:{id}:p{N}`. Those don't collide. But the **default** preview —
+the parameter left at `None`, a bare stream-hash worker id — still reads and
+deletes the bare `stream_profile:{id}` and still writes `channel_stream:{id}`.
+It's the only kind the web UI starts: both preview buttons build
+`/proxy/ts/stream/{stream_hash}`, and nothing in the frontend builds a `.p{N}`
+id. So the collision is unchanged for UI users.
+
+Core now passes the new keyword on **every** call, as `None` for a default
+preview: `generate_stream_url()` calls `get_stream(preferred_profile_id=None)`,
+and `release_worker_stream()` calls `release_stream(m3u_profile_id=None)`.
+
 ## The double release
 
 `ChannelService.initialize_channel()` records the preview's profile in its
@@ -35,7 +51,12 @@ calls `Stream.release_stream()` again, finds the key gone, and falls back to
 second time. `Channel.release_stream()` clears those metadata fields to prevent
 exactly this, and upstream `dev`'s newer profile-scoped preview release does too
 (*"Clear worker metadata so stop-chain metadata fallback does not DECR again"*).
-The default preview path never got the same treatment.
+The default preview path never got the same treatment in 0.31.0.
+
+**0.32.0 fixed it upstream**: stock `release_stream()` now clears the same two
+fields before releasing, the same mechanism this plugin uses. The plugin keeps
+its own clear deliberately. It is what protects 0.31.0, and on 0.32.0 `hdel` of
+already-cleared fields is a no-op, so nothing is released twice.
 
 ## The fix
 
@@ -71,6 +92,14 @@ Do for the default preview what `dev` already does for profile-scoped previews.
    both values with the preview's own, so its metadata is accurate. That keeps
    stats correct, and it means a preview reserved under the plugin still releases
    through stock code's metadata fallback if the plugin is disabled mid-preview.
+   Two cases pass through untouched: a profile-scoped worker id
+   (`{stream_hash}.p{N}`, whose values stock already reads correctly from the id),
+   and **any** call while the plugin's `Stream` pair isn't installed. Without
+   the pair, stock reserved the preview, the plugin's key doesn't exist, and
+   "replacing" stock's correct values would erase them. That was 1.0.0's
+   half-installed state on 0.32.0: no stream or provider in stats, and core's
+   metadata fallback disarmed. `install()` now also refuses to install this
+   wrapper unless the pair is installed.
 
 All three targets are class attributes, resolved at call time, so no module
 rebinding is needed. All three run only in the uWSGI workers serving the live
@@ -78,26 +107,55 @@ proxy; Celery is not involved.
 
 ## Every path that touches a preview's slot
 
-| path | under the plugin |
+0.32.0 routes every preview release through `url_utils.release_worker_stream()`,
+which for a stream-hash worker calls `Stream.release_stream(m3u_profile_id=…)`.
+`ProxyServer._release_stream_resources()` calls it and then falls back to the
+metadata. So the order the release-once guarantee depends on still holds:
+the `Stream` release first, then the metadata fallback.
+
+| path (0.31.0 / 0.32.0) | under the plugin |
 |---|---|
-| `generate_stream_url()` → `stream.get_stream()` | own key; own provider only |
-| `generate_stream_url()` error paths → `release_stream()` if `slot_reserved` | `slot_reserved` is True only for a fresh reservation, so a reused one is never released by a failing joiner |
-| generator `_cleanup` (shutdown delay 0) → `release_stream()` | releases once, clears metadata |
-| teardown `_release_stream_resources()` → `release_stream()` | `False` after the generator released, then the fallback finds cleared metadata: no second release |
+| `generate_stream_url()` → `get_stream()` / `get_stream(preferred_profile_id=None)` | own key; own provider only |
+| `generate_stream_url()` error paths → `release_stream()` / `release_stream(m3u_profile_id=None)` if `slot_reserved` | `slot_reserved` is True only for a fresh reservation, so a reused one is never released by a failing joiner |
+| `stream_ts` error branches → `release_worker_stream()` if `connection_allocated` (0.32.0) | the plugin's release, as above |
+| generator `_cleanup` (shutdown delay 0) → `release_stream()` / `release_worker_stream()` | releases once, clears metadata |
+| teardown `_release_stream_resources()` → `release_stream()` / `release_worker_stream()` | `False` after the generator released, then the fallback finds cleared metadata: no second release |
 | teardown metadata fallback | only reached for a preview with no key of ours, using that preview's own metadata |
-| plugin disabled mid-preview | stock `release_stream()` finds no shared key, falls back to the accurate metadata: released once |
+| profile-scoped preview, any of the above with `.p{N}` / a non-`None` profile (0.32.0) | stock, untouched (all three wrappers) |
+| plugin disabled mid-preview | stock `release_stream()` finds no shared key, falls back to the accurate metadata: released once. Exception: see Known edges |
 
 ## Signature drift
 
-The wrappers accept `*args, **kwargs`. Anything beyond the v0.31.0 parameters
-(`requester` for `get_stream`, nothing for `release_stream`) is handed to stock
-code unchanged, with one warning per process. `dev` already adds
-`preferred_profile_id` / `m3u_profile_id` for profile-scoped previews, which
-don't collide — stock code is correct for those calls. `install()` also checks
-the signatures up front, and patches the two `Stream` methods only as a pair: a
-patched `get_stream` with a stock `release_stream` would strand reservations.
+`install()` accepts exactly two shapes per method and refuses anything else:
+
+| | 0.31.0 | 0.32.0 |
+|---|---|---|
+| `get_stream` | `(self, requester)` | `(self, requester, preferred_profile_id)` |
+| `release_stream` | `(self)` | `(self, m3u_profile_id)` |
+
+It patches the two `Stream` methods only as a pair (a patched `get_stream` with
+a stock `release_stream` would strand reservations), and `initialize_channel`
+only together with the pair.
+
+At call time the wrappers bind the arguments against the live original's
+signature, so keyword and positional calls route the same, then route by
+**value**:
+
+- the profile-scoped parameter is not `None` → stock, unchanged (collision-free);
+- `requester` → ignored, as stock's stream path ignores it;
+- anything else → stock, unchanged, with one warning per process.
+
+Routing by value, not presence, is essential. Core passes the scoped keyword on
+every 0.32.0 call, so "unknown keyword → stock" (1.0.0's rule) would install
+cleanly, report the fix active, and fix nothing.
 
 ## Known edges
+
+- Disabling the plugin while a preview of a running channel's **starting**
+  stream is open: stock `release_stream()` then reads the bare
+  `stream_profile:{id}` key, which is the channel's. That's the original bug,
+  once, for that preview. Same on 0.31.0 and 0.32.0. Hence "restart with no
+  previews open."
 
 - Enabling or disabling without a restart, while a stock preview is open, can
   leave a stale shared `stream_profile:{id}` key. Harmless while the plugin is
@@ -117,13 +175,23 @@ python test_logic.py
 ```
 
 It covers the collision, failover-then-preview, the double release, liveness and
-leftovers, the concurrent-start race, profile order, signature drift, the
-initialize wrapper's pass-through and fail-open behavior, and manifest/class
-parity. The guards were mutation-checked: reintroducing the shared key, skipping
-the metadata clear, always treating a preview as live, claiming the key without
-NX, and disabling the drift sensor each fail tests.
+leftovers, the concurrent-start race, profile order, initialize pass-through,
+fail-open and gating, and manifest/class parity. The wrappers run against
+stand-ins with the **real** 0.31.0 and 0.32.0 signatures and call shapes
+(keyword `None`, positional, scoped, unknown). `install()` runs against stand-in
+Django modules for both shapes, an unknown shape, and a mixed pair. The guards
+were mutation-checked. Each of these fails tests: reintroducing the shared key;
+skipping the metadata clear; always treating a preview as live; claiming the key
+without NX; disabling the drift sensor; routing by presence instead of value;
+sending scoped calls to the plugin; treating an unknown parameter as the plugin
+path; removing the initialize gate; not passing scoped worker ids through;
+installing initialize without the pair; accepting only 0.31.0's shape;
+accepting any shape; and not reverting a half-installed pair.
 
 On a Dispatcharr instance, the acceptance tests in the Dispatcharr clone
 (`apps/proxy/live_proxy/tests/test_preview_slot_fix_acceptance.py`) re-run the
 seven collision scenarios against real core with the patches installed, plus the
-double release, disable-mid-preview and clean-uninstall guarantees.
+double release, disable-mid-preview and clean-uninstall guarantees. Previews are
+driven with core's own call shape for the running release. On 0.32.0 they add
+core's real `release_worker_stream()` teardown and the profile-scoped
+pass-through.

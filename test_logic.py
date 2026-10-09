@@ -326,39 +326,344 @@ class SmallHelperTests(unittest.TestCase):
         self.assertFalse(key.startswith(("stream_profile:", "channel_stream:")))
 
 
-class SignatureDriftTests(unittest.TestCase):
-    """Unknown parameters mean a newer core: hand the call to stock untouched."""
+# --------------------------------------------------------------------------- #
+# Stock stand-ins with core's REAL signatures. The wrappers bind against the
+# original's signature, so these must match Dispatcharr exactly:
+#   v0.31.0  get_stream(self, requester=None)        release_stream(self)
+#   v0.32.0  get_stream(self, requester=None,        release_stream(self,
+#                       preferred_profile_id=None)                  m3u_profile_id=None)
+# --------------------------------------------------------------------------- #
+
+def stock_v031(calls):
+    def get_stream(self, requester=None):
+        calls.append(("stock get_stream", {"requester": requester}))
+        return "stock"
+
+    def release_stream(self):
+        calls.append(("stock release_stream", {}))
+        return "stock"
+
+    return get_stream, release_stream
+
+
+def stock_v032(calls):
+    def get_stream(self, requester=None, preferred_profile_id=None):
+        calls.append(("stock get_stream", {"preferred_profile_id": preferred_profile_id}))
+        return "stock"
+
+    def release_stream(self, m3u_profile_id=None):
+        calls.append(("stock release_stream", {"m3u_profile_id": m3u_profile_id}))
+        return "stock"
+
+    return get_stream, release_stream
+
+
+def fake_runtime(redis):
+    return {
+        "redis": redis,
+        "reserve": fake_reserve,
+        "release": fake_release,
+        "metadata_key": lambda stream_hash: f"live:channel:{stream_hash}:metadata",
+        "state_field": STATE_FIELD,
+        "metadata_fields": META_FIELDS,
+        "live_states": LIVE_STATES,
+    }
+
+
+def stream_obj(profiles):
+    return types.SimpleNamespace(
+        id=STREAM,
+        stream_hash="hash-30001",          # metadata key == META
+        m3u_account=types.SimpleNamespace(
+            profiles=types.SimpleNamespace(all=lambda: list(profiles))),
+    )
+
+
+class _WrapperHarness(unittest.TestCase):
+    """Runs the real Stream wrappers against a stock stand-in and FakeRedis."""
+
+    stock = staticmethod(stock_v032)
 
     def setUp(self):
         self.calls = []
+        self.redis = FakeRedis()
         self.saved = dict(patch._originals)
-        patch._originals["get_stream"] = lambda s, *a, **k: self.calls.append(("get", a, k)) or "stock"
-        patch._originals["release_stream"] = lambda s, *a, **k: self.calls.append(("rel", a, k)) or "stock"
+        self.saved_runtime = patch._runtime
+        get_stream, release_stream = self.stock(self.calls)
+        patch._originals["get_stream"] = get_stream
+        patch._originals["release_stream"] = release_stream
+        patch._runtime = lambda: fake_runtime(self.redis)
         patch._drift_logged.clear()
 
     def tearDown(self):
         patch._originals.clear()
         patch._originals.update(self.saved)
+        patch._runtime = self.saved_runtime
         patch._drift_logged.clear()
 
-    def test_get_stream_with_unknown_keyword_goes_to_stock(self):
-        obj = types.SimpleNamespace(id=STREAM)
-        self.assertEqual(patch.patched_get_stream(obj, preferred_profile_id=3), "stock")
-        self.assertEqual(self.calls, [("get", (), {"preferred_profile_id": 3})])
+    def get(self, *args, profiles=(), **kwargs):
+        stream = stream_obj(profiles or [P(3, max_streams=2)])
+        return patch.patched_get_stream(stream, *args, **kwargs)
 
-    def test_release_stream_with_an_argument_goes_to_stock(self):
-        obj = types.SimpleNamespace(id=STREAM)
-        self.assertEqual(patch.patched_release_stream(obj, m3u_profile_id=3), "stock")
-        self.assertEqual(self.calls, [("rel", (), {"m3u_profile_id": 3})])
+    def rel(self, *args, **kwargs):
+        return patch.patched_release_stream(stream_obj([]), *args, **kwargs)
 
-    def test_drift_is_reported_once(self):
-        obj = types.SimpleNamespace(id=STREAM)
+
+class V032CallShapeTests(_WrapperHarness):
+    """Core v0.32.0 passes the new keywords on EVERY call -- as None for a
+    default preview (url_utils.generate_stream_url / release_worker_stream)."""
+
+    def test_default_preview_get_with_none_keyword_takes_the_plugin_path(self):
+        self.assertEqual(self.get(preferred_profile_id=None), (STREAM, 3, None, True))
+        self.assertEqual(self.calls, [], "stock must not run for a default preview")
+        self.assertEqual(self.redis.get(patch.preview_key(STREAM)), b"3")
+        self.assertIsNone(self.redis.get(f"stream_profile:{STREAM}"))
+
+    def test_default_preview_release_with_none_keyword_takes_the_plugin_path(self):
+        self.get(preferred_profile_id=None)
+        self.assertTrue(self.rel(m3u_profile_id=None))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(count(self.redis, 3), 0)
+
+    def test_positional_none_is_the_plugin_path_too(self):
+        self.assertEqual(self.get(None, None)[3], True)
+        self.assertTrue(self.rel(None))
+        self.assertEqual(self.calls, [])
+
+    def test_the_collision_is_fixed_with_v032_call_shapes(self):
+        fake_reserve(P(7), self.redis)                       # channel holds 1/1
+        self.redis.set(f"stream_profile:{STREAM}", 7)        # channel's ledger
+        self.assertEqual(self.get(preferred_profile_id=None, profiles=[P(7)]),
+                         (None, None, patch.FULL_ERROR, False))
+        self.assertFalse(self.rel(m3u_profile_id=None))
+        self.assertEqual(count(self.redis, 7), 1, "the channel's slot must survive")
+        self.assertEqual(self.redis.get(f"stream_profile:{STREAM}"), b"7")
+        self.assertEqual(self.calls, [])
+
+    def test_scoped_get_goes_to_stock_without_a_warning(self):
+        self.assertEqual(self.get(preferred_profile_id=3), "stock")
+        self.assertEqual(self.calls, [("stock get_stream", {"preferred_profile_id": 3})])
+        self.assertEqual(patch._drift_logged, set())
+        self.assertEqual(self.redis.strings, {})
+
+    def test_scoped_release_goes_to_stock_without_a_warning(self):
+        self.assertEqual(self.rel(m3u_profile_id=3), "stock")
+        self.assertEqual(self.calls, [("stock release_stream", {"m3u_profile_id": 3})])
+        self.assertEqual(patch._drift_logged, set())
+
+    def test_scoped_positional_goes_to_stock(self):
+        self.assertEqual(self.get(None, 3), "stock")
+        self.assertEqual(self.rel(3), "stock")
+
+    def test_unknown_keyword_is_drift_reported_once(self):
+        # Handed to stock unchanged -- including stock's own TypeError.
         for _ in range(3):
-            patch.patched_get_stream(obj, preferred_profile_id=3)
+            with self.assertRaises(TypeError):
+                self.get(lease=1)
         self.assertEqual(patch._drift_logged, {"Stream.get_stream"})
+        self.assertEqual(self.redis.strings, {})
+
+
+class V031CallShapeTests(_WrapperHarness):
+    stock = staticmethod(stock_v031)
+
+    def test_v031_calls_take_the_plugin_path(self):
+        self.assertEqual(self.get()[3], True)
+        self.assertEqual(self.get(requester="someone")[3], False, "reused while live")
+        self.assertTrue(self.rel())
+        self.assertEqual(self.calls, [])
+
+    def test_v032_keyword_on_a_v031_core_is_drift(self):
+        # Exactly what stock v0.31.0 does with such a call: raise.
+        with self.assertRaises(TypeError):
+            self.get(preferred_profile_id=None)
+        with self.assertRaises(TypeError):
+            self.rel(m3u_profile_id=None)
+        self.assertEqual(patch._drift_logged, {"Stream.get_stream", "Stream.release_stream"})
+        self.assertEqual(self.redis.strings, {})
+
+
+class ClassifyCallTests(unittest.TestCase):
+    def test_routes(self):
+        get32, rel32 = stock_v032([])
+        cases = [
+            ((get32, "get_stream", (), {}), patch.ROUTE_PLUGIN),
+            ((get32, "get_stream", (), {"requester": "u"}), patch.ROUTE_PLUGIN),
+            ((get32, "get_stream", (), {"preferred_profile_id": None}), patch.ROUTE_PLUGIN),
+            ((get32, "get_stream", (), {"preferred_profile_id": 0}), patch.ROUTE_SCOPED),
+            ((get32, "get_stream", (), {"preferred_profile_id": "4"}), patch.ROUTE_SCOPED),
+            ((get32, "get_stream", (None, None, None), {}), patch.ROUTE_DRIFT),
+            ((rel32, "release_stream", (), {}), patch.ROUTE_PLUGIN),
+            ((rel32, "release_stream", (), {"m3u_profile_id": None}), patch.ROUTE_PLUGIN),
+            ((rel32, "release_stream", (), {"m3u_profile_id": 2}), patch.ROUTE_SCOPED),
+            ((rel32, "release_stream", (), {"force": True}), patch.ROUTE_DRIFT),
+        ]
+        for (original, name, args, kwargs), expected in cases:
+            with self.subTest(name=name, args=args, kwargs=kwargs):
+                self.assertEqual(
+                    patch.classify_call(original, name, object(), args, kwargs), expected)
+
+    def test_a_parameter_the_plugin_does_not_know_is_drift(self):
+        # A future core whose original accepts something new: the call binds,
+        # but the plugin can't know what it means, even when it is None.
+        def get_stream(self, requester=None, preferred_profile_id=None, lease=None):
+            return "stock"
+
+        for kwargs in ({"lease": 1}, {"lease": None}):
+            with self.subTest(kwargs=kwargs):
+                self.assertEqual(
+                    patch.classify_call(get_stream, "get_stream", object(), (), kwargs),
+                    patch.ROUTE_DRIFT)
+        self.assertEqual(
+            patch.classify_call(get_stream, "get_stream", object(), (), {}),
+            patch.ROUTE_PLUGIN)
+
+    def test_scoped_worker_ids(self):
+        self.assertEqual(patch.scoped_preview_profile("ab" * 32 + ".p3"), 3)
+        self.assertIsNone(patch.scoped_preview_profile("ab" * 32))
+        self.assertIsNone(patch.scoped_preview_profile("00000000-0000-4000-8000-000000000001"))
+        self.assertIsNone(patch.scoped_preview_profile(".p3"))
+        self.assertIsNone(patch.scoped_preview_profile("abc.pX"))
+        self.assertIsNone(patch.scoped_preview_profile(None))
+
+
+# --------------------------------------------------------------------------- #
+# install() against stand-in Django modules
+# --------------------------------------------------------------------------- #
+
+def _initialize_channel(channel_id, stream_url, user_agent, transcode=False,
+                        stream_profile_value=None, stream_id=None,
+                        m3u_profile_id=None, channel_name=None, stream_name=None):
+    return (channel_id, stream_id, m3u_profile_id)
+
+
+class _FakeModules:
+    """Temporarily puts stand-in modules into sys.modules."""
+
+    def __init__(self, **attrs_by_module):
+        self.attrs_by_module = attrs_by_module
+
+    def __enter__(self):
+        names = set()
+        for dotted in self.attrs_by_module:
+            parts = dotted.split(".")
+            names.update(".".join(parts[:i]) for i in range(1, len(parts) + 1))
+        self.saved = {n: sys.modules.get(n) for n in names}
+        for n in names:
+            sys.modules[n] = types.ModuleType(n)
+        for dotted, attrs in self.attrs_by_module.items():
+            for key, value in attrs.items():
+                setattr(sys.modules[dotted], key, value)
+        return self
+
+    def __exit__(self, *exc):
+        for n, mod in self.saved.items():
+            if mod is None:
+                sys.modules.pop(n, None)
+            else:
+                sys.modules[n] = mod
+
+
+class _FakeDjango(_FakeModules):
+    """`apps.channels.models.Stream` and `ChannelService` stand-ins for install()."""
+
+    def __init__(self, get_stream, release_stream):
+        self.Stream = type("Stream", (), {"get_stream": get_stream,
+                                          "release_stream": release_stream})
+        self.ChannelService = type("ChannelService", (), {
+            "initialize_channel": staticmethod(_initialize_channel)})
+        super().__init__(**{
+            "apps.channels.models": {"Stream": self.Stream},
+            "apps.proxy.live_proxy.services.channel_service":
+                {"ChannelService": self.ChannelService},
+        })
+
+    def __enter__(self):
+        super().__enter__()
+        self.saved_originals = dict(patch._originals)
+        patch._originals.clear()
+        return self
+
+    def __exit__(self, *exc):
+        patch.uninstall()
+        patch._originals.clear()
+        patch._originals.update(self.saved_originals)
+        super().__exit__(*exc)
+
+
+def stream_lookup(stream_id):
+    """`Stream.objects.filter(...).values_list(...).first()` -> stream_id."""
+    result = types.SimpleNamespace(first=lambda: stream_id)
+    query = types.SimpleNamespace(values_list=lambda *a, **k: result)
+    stream_cls = type("Stream", (), {
+        "objects": types.SimpleNamespace(filter=lambda **k: query)})
+    return _FakeModules(**{"apps.channels.models": {"Stream": stream_cls}})
+
+
+ALL_ON = {"Stream.get_stream": True, "Stream.release_stream": True,
+          "ChannelService.initialize_channel": True}
+ALL_OFF = {k: False for k in ALL_ON}
+
+
+class InstallTests(unittest.TestCase):
+    def test_installs_on_v031(self):
+        with _FakeDjango(*stock_v031([])):
+            self.assertEqual(patch.install(), ALL_ON)
+            self.assertEqual(patch.patch_state(), ALL_ON)
+            self.assertTrue(patch.stream_pair_active())
+            self.assertEqual(patch.install(), ALL_ON, "idempotent")
+
+    def test_installs_on_v032(self):
+        with _FakeDjango(*stock_v032([])):
+            self.assertEqual(patch.install(), ALL_ON)
+            self.assertEqual(patch.patch_state(), ALL_ON)
+
+    def test_uninstall_restores_the_originals(self):
+        get_stream, release_stream = stock_v032([])
+        with _FakeDjango(get_stream, release_stream) as fake:
+            patch.install()
+            patch.uninstall()
+            self.assertIs(fake.Stream.__dict__["get_stream"], get_stream)
+            self.assertIs(fake.Stream.__dict__["release_stream"], release_stream)
+            self.assertIs(fake.ChannelService.__dict__["initialize_channel"].__func__,
+                          _initialize_channel)
+            self.assertFalse(patch.stream_pair_active())
+
+    def test_refuses_an_unknown_shape_entirely(self):
+        def get_stream(self, requester=None, preferred_profile_id=None, lease=None):
+            return "stock"
+
+        _get, release_stream = stock_v032([])
+        with _FakeDjango(get_stream, release_stream) as fake:
+            self.assertEqual(patch.install(), ALL_OFF,
+                             "no half-installed state: initialize must not be patched alone")
+            self.assertIs(fake.Stream.__dict__["release_stream"], release_stream)
+            self.assertFalse(patch.stream_pair_active())
+
+    def test_refuses_when_only_release_stream_is_unknown(self):
+        get31, _rel31 = stock_v031([])
+
+        def release_stream(self, m3u_profile_id=None, force=False):
+            return "stock"
+
+        with _FakeDjango(get31, release_stream) as fake:
+            self.assertEqual(patch.install(), ALL_OFF)
+            self.assertIs(fake.Stream.__dict__["get_stream"], get31, "pair reverted")
+
+    def test_supported_shapes(self):
+        get31, rel31 = stock_v031([])
+        get32, rel32 = stock_v032([])
+        self.assertTrue(patch.signature_supported(get31, patch.SUPPORTED_GET_STREAM_PARAMS))
+        self.assertTrue(patch.signature_supported(get32, patch.SUPPORTED_GET_STREAM_PARAMS))
+        self.assertTrue(patch.signature_supported(rel31, patch.SUPPORTED_RELEASE_STREAM_PARAMS))
+        self.assertTrue(patch.signature_supported(rel32, patch.SUPPORTED_RELEASE_STREAM_PARAMS))
+        self.assertFalse(patch.signature_supported(rel32, patch.SUPPORTED_GET_STREAM_PARAMS))
+        self.assertFalse(patch.signature_supported(None, patch.SUPPORTED_GET_STREAM_PARAMS))
 
 
 class InitializeWrapperTests(unittest.TestCase):
+    HASH = "ab" * 32
+
     def setUp(self):
         self.seen = []
 
@@ -369,6 +674,23 @@ class InitializeWrapperTests(unittest.TestCase):
             return True
 
         self.wrapper = patch._make_initialize_wrapper(initialize_channel)
+        self.redis = FakeRedis()
+        self.saved = dict(patch._originals)
+        self.saved_runtime = patch._runtime
+        patch._runtime = lambda: fake_runtime(self.redis)
+        self.set_pair_active(True)
+
+    def tearDown(self):
+        patch._originals.clear()
+        patch._originals.update(self.saved)
+        patch._runtime = self.saved_runtime
+
+    def set_pair_active(self, active):
+        for name in ("get_stream", "release_stream"):
+            if active:
+                patch._originals[name] = lambda *a, **k: None
+            else:
+                patch._originals.pop(name, None)
 
     def test_channels_pass_through_unchanged(self):
         uid = "00000000-0000-4000-8000-000000000001"
@@ -378,8 +700,29 @@ class InitializeWrapperTests(unittest.TestCase):
     def test_fails_open_when_the_lookup_is_unavailable(self):
         # Off-server the Django import fails: the call must still go through,
         # with the caller's own arguments.
-        self.assertTrue(self.wrapper("ab" * 32, "u", "ua", False, 1, None, None))
-        self.assertEqual(self.seen, [("ab" * 32, None, None)])
+        self.assertTrue(self.wrapper(self.HASH, "u", "ua", False, 1, None, None))
+        self.assertEqual(self.seen, [(self.HASH, None, None)])
+
+    def test_default_preview_records_its_own_key(self):
+        self.redis.set(patch.preview_key(STREAM), 3)
+        with stream_lookup(STREAM):
+            self.wrapper(self.HASH, "u", "ua", False, 1, STREAM, 7)
+        self.assertEqual(self.seen, [(self.HASH, STREAM, 3)],
+                         "the channel's profile 7 must be replaced by the preview's own")
+
+    def test_inert_while_the_stream_pair_is_not_installed(self):
+        # Half-installed: stock reserved the preview, so the caller's values
+        # are stock's correct ones and must not be erased.
+        self.set_pair_active(False)
+        with stream_lookup(STREAM):
+            self.wrapper(self.HASH, "u", "ua", False, 1, STREAM, 7)
+        self.assertEqual(self.seen, [(self.HASH, STREAM, 7)])
+
+    def test_scoped_preview_passes_through_unchanged(self):
+        worker = self.HASH + ".p4"
+        with stream_lookup(STREAM):
+            self.wrapper(worker, "u", "ua", False, 1, STREAM, 4)
+        self.assertEqual(self.seen, [(worker, STREAM, 4)])
 
 
 class ManifestParityTests(unittest.TestCase):

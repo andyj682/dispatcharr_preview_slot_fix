@@ -78,17 +78,30 @@ them up.
 
 ## Requirements and limits
 
-- Verified against **Dispatcharr 0.31.0**.
-- If a future Dispatcharr release changes the methods this plugin wraps, it
-  stops applying the fix to those calls and passes them to stock Dispatcharr
-  unchanged, logging a warning so the change is easy to spot. Your previews keep
-  working; you just lose the protection until the plugin is updated.
+- Supports **Dispatcharr 0.31.0 and 0.32.0**. **Dispatcharr 0.32.0 needs plugin
+  1.1.0 or later.** 1.0.0 doesn't install on 0.32.0: **Check status** shows the
+  `Stream` patches as *NOT patched*, and previews run on Dispatcharr's stock
+  code, bug included. Update the plugin, or disable it until you do.
+- Dispatcharr 0.32.0 added *profile-scoped* previews, which keep their own
+  records and don't have this bug. The plugin leaves those to stock Dispatcharr.
+  The web UI's preview buttons start ordinary previews, which are the ones this
+  plugin fixes.
+- If a future Dispatcharr release changes the methods this plugin wraps, the
+  plugin refuses to install and logs an error, and Dispatcharr runs its stock
+  code. Your previews keep working; you just lose the protection until the
+  plugin is updated.
+- A provider that reads fuller than it should is not always this bug. From
+  0.32.0, Dispatcharr can give up on releasing a slot when many streams stop at
+  once, and it logs `Gave up releasing connection slots for profile N … its
+  counters may be stale` when it does. Check for that line first.
 - This fixes the preview problem only. Two smaller problems in live-channel
   failover are out of scope: two channels failing over
   at the same moment can both take a provider's last slot, and a failover whose
   slot update fails still completes.
-- Upstream is reworking this area. Once a Dispatcharr release fixes it, this
-  plugin becomes unnecessary and can be removed.
+- Reported upstream as
+  [Dispatcharr#1773](https://github.com/Dispatcharr/Dispatcharr/issues/1773).
+  Once a Dispatcharr release fixes it, this plugin becomes unnecessary and can
+  be removed.
 
 ## Uninstall
 

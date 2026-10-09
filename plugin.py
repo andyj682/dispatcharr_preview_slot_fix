@@ -54,7 +54,7 @@ class Plugin:
     # UI title only. README / repo / zip keep the fuller "Dispatcharr Preview
     # Slot Fix" name; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "Preview Slot Fix"
-    version = "1.0.0"
+    version = "1.1.0"
     description = (
         "Stops a stream preview from freeing the provider connection of a "
         "channel that is still playing, which can otherwise hand that provider "

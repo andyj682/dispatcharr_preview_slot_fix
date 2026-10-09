@@ -1,7 +1,7 @@
 """Stop direct stream previews from freeing a running channel's provider slot.
 
-THE BUG (Dispatcharr v0.31.0, still present on upstream `dev`)
---------------------------------------------------------------
+THE BUG (Dispatcharr v0.31.0 and v0.32.0; reported upstream as Dispatcharr#1773)
+---------------------------------------------------------------------------------
 Channels record their provider assignment as ``channel_stream:{channel_id}`` and
 ``stream_profile:{stream_id}``, where ``stream_id`` is the stream the channel
 STARTED on. ``channel_stream`` is never updated on failover, so the channel's
@@ -25,17 +25,23 @@ Two more defects on the same path:
 * ``get_stream()`` writes ``channel_stream:{self.id}`` -- a STREAM id in the
   namespace channels key by CHANNEL id -- so previewing stream N overwrites the
   record of channel N.
-* ``release_stream()`` does not clear the preview's metadata. Under the default
-  ``channel_shutdown_delay`` of 0 the output generator releases the preview when
-  its last viewer leaves, and teardown then finds the key gone and falls back to
-  the METADATA, releasing the same provider a second time.
-  ``Channel.release_stream()`` already clears those fields for exactly this
-  reason, and upstream's newer profile-scoped preview release does too.
+* ``release_stream()`` does not clear the preview's metadata (v0.31.0; fixed in
+  v0.32.0). Under the default ``channel_shutdown_delay`` of 0 the output
+  generator releases the preview when its last viewer leaves, and teardown then
+  finds the key gone and falls back to the METADATA, releasing the same provider
+  a second time. ``Channel.release_stream()`` already clears those fields for
+  exactly this reason, and so does the profile-scoped preview release.
+
+v0.32.0 added profile-scoped previews (``get_stream(preferred_profile_id=N)``,
+``release_stream(m3u_profile_id=N)``, worker id ``{stream_hash}.p{N}``), which
+keep their own ``stream_profile:{id}:p{N}`` key and do not collide. But the
+default preview -- the parameter left at None, a bare stream-hash worker id --
+is unchanged, and it is the only kind the web UI starts.
 
 THE FIX
 -------
-Do for the default preview what upstream ``dev`` already does for its
-profile-scoped previews:
+Do for the default preview what upstream already does for its profile-scoped
+previews:
 
 1. ``Stream.get_stream`` keeps the preview's reservation under its own key
    (``PREVIEW_KEY_PREFIX``) and never writes ``stream_profile:{id}`` or
@@ -53,6 +59,9 @@ profile-scoped previews:
    wrapper replaces them with the preview's own values, so the preview's
    metadata is accurate. That also keeps a preview that is live when the plugin
    is DISABLED releasable through stock code's metadata fallback.
+
+Profile-scoped previews (v0.32.0+) are passed to stock code untouched by all
+three wrappers: stock is already correct for them.
 
 All three targets are class attributes, so callers resolve them at call time and
 no module rebinding is needed. All three run only in the uWSGI workers that
@@ -93,16 +102,71 @@ PREVIEW_KEY_PREFIX = "preview_slot_fix:stream_profile:"
 
 FULL_ERROR = "All active M3U profiles have reached maximum connection limits"
 
-# Parameters of the v0.31.0 targets. A call carrying anything else means core's
-# signature has changed under us: hand the call to stock code unmodified (it is
-# no worse than an install without this plugin) and say so once.
-EXPECTED_GET_STREAM_PARAMS = ("self", "requester")
-EXPECTED_RELEASE_STREAM_PARAMS = ("self",)
+# The signatures this plugin knows, oldest first: v0.31.0, then v0.32.0 (which
+# added the profile-scoped preview parameter). install() refuses any other shape.
+SUPPORTED_GET_STREAM_PARAMS = (
+    ("self", "requester"),
+    ("self", "requester", "preferred_profile_id"),
+)
+SUPPORTED_RELEASE_STREAM_PARAMS = (
+    ("self",),
+    ("self", "m3u_profile_id"),
+)
 REQUIRED_INITIALIZE_PARAMS = ("channel_id", "stream_id", "m3u_profile_id")
+
+# How each Stream method's arguments are routed at call time:
+#   ignored -- accepted and irrelevant to the preview's bookkeeping;
+#   scoped  -- not None selects core's profile-scoped preview, which is
+#              collision-free in stock code, so the call goes to stock.
+# Core passes `scoped` on EVERY call, as None for a default preview, so routing
+# must look at its value, never at whether it was passed.
+# Any other argument means core changed under us: stock, plus one warning.
+ROUTE_PLUGIN = "plugin"
+ROUTE_SCOPED = "scoped"
+ROUTE_DRIFT = "drift"
+_ROUTING = {
+    "get_stream": {"ignored": ("requester",), "scoped": "preferred_profile_id"},
+    "release_stream": {"ignored": (), "scoped": "m3u_profile_id"},
+}
 
 
 def preview_key(stream_id) -> str:
     return f"{PREVIEW_KEY_PREFIX}{int(stream_id)}"
+
+
+def classify_call(original, name, instance, args, kwargs) -> str:
+    """Which path a call to ``Stream.<name>`` takes; see ``_ROUTING``.
+
+    Binds against the live original's signature, so it is the same whether core
+    passes an argument by keyword or by position.
+    """
+    rule = _ROUTING[name]
+    try:
+        bound = inspect.signature(original).bind(instance, *args, **kwargs)
+    except TypeError:
+        return ROUTE_DRIFT
+    for param, value in list(bound.arguments.items())[1:]:
+        if param in rule["ignored"]:
+            continue
+        if param == rule["scoped"]:
+            if value is not None:
+                return ROUTE_SCOPED
+            continue
+        return ROUTE_DRIFT
+    return ROUTE_PLUGIN
+
+
+def scoped_preview_profile(worker_id):
+    """The profile id of a profile-scoped preview worker id, else None.
+
+    Mirrors core's ``parse_preview_worker_id`` (v0.32.0+): ``{stream_hash}.p{N}``.
+    """
+    if not worker_id or not isinstance(worker_id, str):
+        return None
+    head, sep, tail = worker_id.rpartition(".p")
+    if not sep or not head or not tail.isdigit():
+        return None
+    return int(tail)
 
 
 def _decode(value):
@@ -298,13 +362,18 @@ def _runtime():
     }
 
 
+def _route(name, instance, args, kwargs):
+    """(original, route) for a call, logging drift once."""
+    original = _originals[name]
+    route = classify_call(original, name, instance, args, kwargs)
+    if route == ROUTE_DRIFT:
+        _log_drift_once(f"Stream.{name}", args, kwargs)
+    return original, route
+
+
 def patched_get_stream(self, *args, **kwargs):
-    original = _originals["get_stream"]
-    # v0.31.0: get_stream(self, requester=None). `requester` is unused by the
-    # stream path; anything else is a newer core -- step aside.
-    unknown = [k for k in kwargs if k != "requester"]
-    if len(args) > 1 or unknown:
-        _log_drift_once("Stream.get_stream", args, kwargs)
+    original, route = _route("get_stream", self, args, kwargs)
+    if route != ROUTE_PLUGIN:
         return original(self, *args, **kwargs)
     try:
         rt = _runtime()
@@ -330,9 +399,8 @@ def patched_get_stream(self, *args, **kwargs):
 
 
 def patched_release_stream(self, *args, **kwargs):
-    original = _originals["release_stream"]
-    if args or kwargs:
-        _log_drift_once("Stream.release_stream", args, kwargs)
+    original, route = _route("release_stream", self, args, kwargs)
+    if route != ROUTE_PLUGIN:
         return original(self, *args, **kwargs)
     try:
         rt = _runtime()
@@ -358,18 +426,33 @@ def patched_release_stream(self, *args, **kwargs):
     return False
 
 
+def stream_pair_active() -> bool:
+    """True while this process runs the plugin's Stream.get_stream/release_stream."""
+    return "get_stream" in _originals and "release_stream" in _originals
+
+
 def _make_initialize_wrapper(original):
     signature = inspect.signature(original)
 
     @functools.wraps(original)
     def patched_initialize_channel(*args, **kwargs):
+        # The preview's own key exists only while the Stream pair is ours.
+        # Without the pair, stock reserved the preview and the caller's values
+        # are stock's own correct ones -- overriding them would erase them.
+        if not stream_pair_active():
+            return original(*args, **kwargs)
         try:
             bound = signature.bind_partial(*args, **kwargs)
         except TypeError:
             _log_drift_once("ChannelService.initialize_channel", args, kwargs)
             return original(*args, **kwargs)
         channel_id = bound.arguments.get("channel_id")
-        if not looks_like_stream_hash(channel_id):
+        # Channels (UUID) and profile-scoped previews ({hash}.p{N}, v0.32.0+)
+        # are stock's business; only a default preview is ours.
+        if (
+            not looks_like_stream_hash(channel_id)
+            or scoped_preview_profile(channel_id) is not None
+        ):
             return original(*args, **kwargs)
         try:
             from apps.channels.models import Stream
@@ -410,6 +493,10 @@ def _params(func):
     return tuple(inspect.signature(func).parameters)
 
 
+def signature_supported(func, supported) -> bool:
+    return func is not None and _params(func) in supported
+
+
 def install():
     """Patch all three targets. Idempotent. Returns {target: bool}."""
     from apps.channels.models import Stream
@@ -417,19 +504,19 @@ def install():
 
     result = {}
 
-    for name, replacement, expected in (
-        ("get_stream", patched_get_stream, EXPECTED_GET_STREAM_PARAMS),
-        ("release_stream", patched_release_stream, EXPECTED_RELEASE_STREAM_PARAMS),
+    for name, replacement, supported in (
+        ("get_stream", patched_get_stream, SUPPORTED_GET_STREAM_PARAMS),
+        ("release_stream", patched_release_stream, SUPPORTED_RELEASE_STREAM_PARAMS),
     ):
         current = Stream.__dict__.get(name)
         if getattr(current, _TAG, False):
             result[f"Stream.{name}"] = True
             continue
-        if current is None or _params(current) != expected:
+        if not signature_supported(current, supported):
             logger.error(
-                "%s Stream.%s has signature %s, expected %s -- NOT patched. "
+                "%s Stream.%s has signature %s, expected one of %s -- NOT patched. "
                 "Re-check this plugin against the current Dispatcharr release.",
-                LOG_TAG, name, _params(current) if current else None, expected,
+                LOG_TAG, name, _params(current) if current else None, supported,
             )
             result[f"Stream.{name}"] = False
             continue
@@ -439,10 +526,26 @@ def install():
         setattr(Stream, name, wrapped)
         result[f"Stream.{name}"] = True
 
+    # The two Stream patches only work as a pair: a patched get_stream with a
+    # stock release_stream (or the reverse) would leave reservations nobody
+    # releases. If either failed, revert both.
+    if not (result.get("Stream.get_stream") and result.get("Stream.release_stream")):
+        _revert_stream_pair(Stream)
+        result["Stream.get_stream"] = result["Stream.release_stream"] = False
+
     raw = ChannelService.__dict__.get("initialize_channel")
     current = raw.__func__ if isinstance(raw, staticmethod) else raw
     if getattr(current, _TAG, False):
         result["ChannelService.initialize_channel"] = True
+    elif not result["Stream.get_stream"]:
+        # It reads the preview key only the patched pair writes; alone it would
+        # replace stock's correct preview metadata with nothing.
+        logger.error(
+            "%s ChannelService.initialize_channel NOT patched because the Stream "
+            "patches are not installed. Dispatcharr is running stock preview code.",
+            LOG_TAG,
+        )
+        result["ChannelService.initialize_channel"] = False
     elif current is None or not all(
         p in _params(current) for p in REQUIRED_INITIALIZE_PARAMS
     ):
@@ -456,13 +559,6 @@ def install():
         _originals["initialize_channel"] = current
         ChannelService.initialize_channel = staticmethod(_make_initialize_wrapper(current))
         result["ChannelService.initialize_channel"] = True
-
-    # The two Stream patches only work as a pair: a patched get_stream with a
-    # stock release_stream (or the reverse) would leave reservations nobody
-    # releases. If either failed, revert both.
-    if not (result.get("Stream.get_stream") and result.get("Stream.release_stream")):
-        _revert_stream_pair(Stream)
-        result["Stream.get_stream"] = result["Stream.release_stream"] = False
 
     logger.info("%s install: %s", LOG_TAG, result)
     return result

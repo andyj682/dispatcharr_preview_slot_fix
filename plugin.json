@@ -1,6 +1,6 @@
 {
   "name": "Preview Slot Fix",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Stops a stream preview from freeing the provider connection of a channel that is still playing, which can otherwise hand that provider to the next channel that starts.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_preview_slot_fix",
