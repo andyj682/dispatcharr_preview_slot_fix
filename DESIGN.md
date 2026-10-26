@@ -4,6 +4,26 @@ Why this plugin is built the way it is. Written against Dispatcharr **0.31.0**,
 updated for **0.32.0** (plugin 1.1.0). The bug is reported upstream as
 [Dispatcharr#1773](https://github.com/Dispatcharr/Dispatcharr/issues/1773).
 
+## Retired: Dispatcharr 0.33.0 fixes it
+
+Dispatcharr 0.33.0 fixed #1773 with this plugin's design. Default previews keep
+their own `stream_profile:{id}:preview` key (`Stream.preview_profile_key()`),
+reuse it only while the preview is live, and claim leftovers with `GETDEL`.
+Teardown deletes only preview keys, and an atomic claim on the metadata's
+`m3u_profile` field makes each release happen once.
+
+The method signatures didn't change, so 1.1.0's install check would accept
+0.33.0 and replace core's methods. But core now reads and deletes its own
+`:preview` key outside those methods (`stream_ts`, and the metadata fallback in
+`ProxyServer._release_profile_slot_from_redis_metadata`). The plugin's parallel
+key works only because its `initialize_channel` wrapper papers over the
+mismatch, and it never takes part in core's claim. So from 1.2.0, `install()`
+patches nothing when `Stream.preview_profile_key` exists (`NATIVE_FIX_ATTR`).
+That method arrived with the fix and isn't in 0.31.0 or 0.32.0. **Check status**
+then says to remove the plugin.
+
+Everything below describes the plugin as it runs on 0.31.0 and 0.32.0.
+
 ## The collision
 
 Channels record a provider assignment as `channel_stream:{channel_id}` and
@@ -186,7 +206,9 @@ without NX; disabling the drift sensor; routing by presence instead of value;
 sending scoped calls to the plugin; treating an unknown parameter as the plugin
 path; removing the initialize gate; not passing scoped worker ids through;
 installing initialize without the pair; accepting only 0.31.0's shape;
-accepting any shape; and not reverting a half-installed pair.
+accepting any shape; not reverting a half-installed pair; and, for 0.33.0,
+ignoring the native fix, checking the wrong attribute, treating every release
+as fixed, logging on every install, and a status that misses the fix.
 
 On a Dispatcharr instance, the acceptance tests in the Dispatcharr clone
 (`apps/proxy/live_proxy/tests/test_preview_slot_fix_acceptance.py`) re-run the

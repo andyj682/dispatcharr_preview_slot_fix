@@ -1,7 +1,16 @@
 # Dispatcharr Preview Slot Fix
 
+> **Not needed from Dispatcharr 0.33.0.** Dispatcharr 0.33.0 fixes this bug
+> itself
+> ([Dispatcharr#1773](https://github.com/Dispatcharr/Dispatcharr/issues/1773)),
+> using the same approach as this plugin. **On 0.33.0 or later, disable and
+> remove the plugin.** From version 1.2.0 the plugin detects the fix and installs
+> nothing, and **Check status** says it isn't needed. Earlier plugin versions
+> would replace Dispatcharr's own fix with theirs, so don't leave 1.0.0 or 1.1.0
+> installed after upgrading. This repository is no longer maintained.
+
 Stops a stream preview from freeing the provider connection of a channel that is
-still playing.
+still playing, on Dispatcharr 0.31.0 and 0.32.0.
 
 ## The problem it solves
 
@@ -78,8 +87,8 @@ them up.
 
 ## Requirements and limits
 
-- Supports **Dispatcharr 0.31.0 and 0.32.0**. **Dispatcharr 0.32.0 needs plugin
-  1.1.0 or later.** 1.0.0 doesn't install on 0.32.0: **Check status** shows the
+- Supports **Dispatcharr 0.31.0 and 0.32.0**; not needed from **0.33.0** (see
+  the top of this page). **Dispatcharr 0.32.0 needs plugin 1.1.0 or later.** 1.0.0 doesn't install on 0.32.0: **Check status** shows the
   `Stream` patches as *NOT patched*, and previews run on Dispatcharr's stock
   code, bug included. Update the plugin, or disable it until you do.
 - Dispatcharr 0.32.0 added *profile-scoped* previews, which keep their own
@@ -99,14 +108,20 @@ them up.
   at the same moment can both take a provider's last slot, and a failover whose
   slot update fails still completes.
 - Reported upstream as
-  [Dispatcharr#1773](https://github.com/Dispatcharr/Dispatcharr/issues/1773).
-  Once a Dispatcharr release fixes it, this plugin becomes unnecessary and can
-  be removed.
+  [Dispatcharr#1773](https://github.com/Dispatcharr/Dispatcharr/issues/1773)
+  and fixed in Dispatcharr 0.33.0.
 
 ## Uninstall
 
 Disable or delete the plugin and restart. Previews go back to Dispatcharr's
-built-in behavior, bug included.
+built-in behavior: on 0.33.0 and later that's the native fix; on 0.31.0 and
+0.32.0 it's the bug.
+
+Uninstall with no previews open. A preview open at that moment holds its
+connection under the plugin's own record, which Dispatcharr never reads, so it
+keeps counting against its provider until Redis is cleared (recreating the
+Dispatcharr container does this). **Check status** lists any such connections
+before you disable the plugin.
 
 ## License
 

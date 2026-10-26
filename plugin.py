@@ -32,6 +32,21 @@ except Exception:  # never break app startup because of the plugin
     logger.exception("[PREVIEW-SLOT-FIX] auto-install on import failed")
 
 
+def _format_retired(reservations):
+    lines = [
+        "NOT NEEDED on this Dispatcharr version: it fixes the preview bug itself "
+        "(Dispatcharr#1773, fixed in 0.33.0). Nothing is patched. Disable and "
+        "remove this plugin."
+    ]
+    if reservations:
+        lines.append(
+            f"Leftover preview connections from an older Dispatcharr: {len(reservations)}. "
+            "They still count against their provider until Redis is cleared "
+            "(recreating the Dispatcharr container does this)."
+        )
+    return "\n".join(lines)
+
+
 def _format_status(state, reservations):
     lines = []
     all_on = all(state.values())
@@ -54,11 +69,12 @@ class Plugin:
     # UI title only. README / repo / zip keep the fuller "Dispatcharr Preview
     # Slot Fix" name; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "Preview Slot Fix"
-    version = "1.1.0"
+    version = "1.2.0"
     description = (
         "Stops a stream preview from freeing the provider connection of a "
-        "channel that is still playing, which can otherwise hand that provider "
-        "to the next channel that starts."
+        "channel that is still playing (Dispatcharr 0.31.0 and 0.32.0). Not "
+        "needed from Dispatcharr 0.33.0, which fixes this itself: there the "
+        "plugin does nothing and can be removed."
     )
     author = "andyj682"
     help_url = "https://github.com/andyj682/dispatcharr_preview_slot_fix"
@@ -72,7 +88,9 @@ class Plugin:
                 "No settings needed. Enable the plugin, then restart the "
                 "Dispatcharr container. Previews keep working as before; they "
                 "just keep their own connection record instead of sharing one "
-                "with live channels."
+                "with live channels. Dispatcharr 0.33.0 and later fix this "
+                "themselves; on those versions the plugin installs nothing and "
+                "can be removed."
             ),
         },
     ]
@@ -93,11 +111,14 @@ class Plugin:
     def run(self, action=None, params=None, context=None):
         if action == "status":
             try:
+                retired = _patch.dispatcharr_fixes_it()
                 state = _patch.patch_state()
                 reservations = _patch.active_preview_reservations()
             except Exception as exc:
                 logger.exception("[PREVIEW-SLOT-FIX] status failed")
                 return {"status": "error", "message": f"Status failed: {exc}"}
+            if retired:
+                return {"status": "ok", "message": _format_retired(reservations)}
             ok, message = _format_status(state, reservations)
             return {"status": "ok" if ok else "error", "message": message}
 

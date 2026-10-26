@@ -661,6 +661,83 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(patch.signature_supported(None, patch.SUPPORTED_GET_STREAM_PARAMS))
 
 
+class _FakeDjangoV033(_FakeDjango):
+    """v0.33.0: v0.32.0's signatures, plus the native fix's key helper."""
+
+    def __init__(self, calls):
+        super().__init__(*stock_v032(calls))
+        self.Stream.preview_profile_key = staticmethod(
+            lambda stream_id: f"stream_profile:{stream_id}:preview")
+
+
+class NativeFixTests(unittest.TestCase):
+    """v0.33.0 fixed #1773 itself with unchanged signatures: install nothing."""
+
+    def test_installs_nothing_when_dispatcharr_has_the_fix(self):
+        with _FakeDjangoV033([]) as fake:
+            before = (fake.Stream.__dict__["get_stream"],
+                      fake.Stream.__dict__["release_stream"],
+                      fake.ChannelService.__dict__["initialize_channel"])
+            self.assertEqual(patch.install(), ALL_OFF)
+            self.assertEqual(patch.patch_state(), ALL_OFF)
+            self.assertEqual(before, (fake.Stream.__dict__["get_stream"],
+                                      fake.Stream.__dict__["release_stream"],
+                                      fake.ChannelService.__dict__["initialize_channel"]))
+            self.assertFalse(patch.stream_pair_active())
+            self.assertTrue(patch.dispatcharr_fixes_it())
+
+    def test_says_so_once_per_process(self):
+        with _FakeDjangoV033([]):
+            with self.assertLogs("plugins.dispatcharr_preview_slot_fix", "WARNING") as logs:
+                patch.install()
+                patch.install()
+            self.assertEqual(len(logs.output), 1)
+            self.assertIn("no longer needed", logs.output[0])
+
+    def test_older_releases_are_not_mistaken_for_the_fix(self):
+        for stock in (stock_v031, stock_v032):
+            with _FakeDjango(*stock([])):
+                self.assertFalse(patch.dispatcharr_fixes_it())
+                self.assertEqual(patch.install(), ALL_ON)
+
+
+class StatusActionTests(unittest.TestCase):
+    def setUp(self):
+        import plugin
+
+        self.plugin = plugin
+        self.saved = {n: getattr(patch, n) for n in
+                      ("dispatcharr_fixes_it", "patch_state", "active_preview_reservations")}
+        patch.patch_state = lambda: dict(ALL_ON)
+        patch.active_preview_reservations = lambda: []
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(patch, name, value)
+
+    def status(self):
+        return self.plugin.Plugin().run(action="status")
+
+    def test_retired_status_says_remove_the_plugin(self):
+        patch.dispatcharr_fixes_it = lambda: True
+        result = self.status()
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("NOT NEEDED", result["message"])
+        self.assertIn("remove this plugin", result["message"])
+        self.assertNotIn("Fix: ACTIVE", result["message"])
+
+    def test_retired_status_mentions_leftovers(self):
+        patch.dispatcharr_fixes_it = lambda: True
+        patch.active_preview_reservations = lambda: [(STREAM, 3, False)]
+        self.assertIn("Leftover preview connections", self.status()["message"])
+
+    def test_active_status_unchanged_on_older_releases(self):
+        patch.dispatcharr_fixes_it = lambda: False
+        result = self.status()
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("Fix: ACTIVE", result["message"])
+
+
 class InitializeWrapperTests(unittest.TestCase):
     HASH = "ab" * 32
 

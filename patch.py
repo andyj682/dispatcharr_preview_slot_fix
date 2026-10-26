@@ -2,6 +2,9 @@
 
 THE BUG (Dispatcharr v0.31.0 and v0.32.0; reported upstream as Dispatcharr#1773)
 ---------------------------------------------------------------------------------
+FIXED IN DISPATCHARR v0.33.0, with the same design as this plugin. There the
+plugin detects the native fix and installs nothing (see ``NATIVE_FIX_ATTR``).
+
 Channels record their provider assignment as ``channel_stream:{channel_id}`` and
 ``stream_profile:{stream_id}``, where ``stream_id`` is the stream the channel
 STARTED on. ``channel_stream`` is never updated on failover, so the channel's
@@ -113,6 +116,23 @@ SUPPORTED_RELEASE_STREAM_PARAMS = (
     ("self", "m3u_profile_id"),
 )
 REQUIRED_INITIALIZE_PARAMS = ("channel_id", "stream_id", "m3u_profile_id")
+
+# Dispatcharr v0.33.0 fixed the bug itself (Dispatcharr#1773): default previews
+# keep their own `stream_profile:{id}:preview` key, named by this static method,
+# which arrived with that fix. Its signatures are unchanged from v0.32.0, so the
+# check above would accept them -- and patching would replace core's correct
+# code with a parallel scheme its teardown can't see. Where it exists, the
+# plugin installs nothing.
+NATIVE_FIX_ATTR = "preview_profile_key"
+NATIVE_FIX_MESSAGE = (
+    "Dispatcharr fixes this bug itself from v0.33.0 (Dispatcharr#1773): previews "
+    "already keep their own connection record. This plugin is no longer needed "
+    "and has NOT patched anything -- disable and remove it."
+)
+
+
+def native_fix_present(stream_cls) -> bool:
+    return hasattr(stream_cls, NATIVE_FIX_ATTR)
 
 # How each Stream method's arguments are routed at call time:
 #   ignored -- accepted and irrelevant to the preview's bookkeeping;
@@ -493,6 +513,16 @@ def _params(func):
     return tuple(inspect.signature(func).parameters)
 
 
+_native_fix_logged = []
+
+
+def dispatcharr_fixes_it() -> bool:
+    """True when the running Dispatcharr has the native fix (v0.33.0+)."""
+    from apps.channels.models import Stream
+
+    return native_fix_present(Stream)
+
+
 def signature_supported(func, supported) -> bool:
     return func is not None and _params(func) in supported
 
@@ -501,6 +531,17 @@ def install():
     """Patch all three targets. Idempotent. Returns {target: bool}."""
     from apps.channels.models import Stream
     from apps.proxy.live_proxy.services.channel_service import ChannelService
+
+    if native_fix_present(Stream):
+        if not _native_fix_logged:
+            _native_fix_logged.append(True)
+            # warning, not info: it must survive wherever root sits at WARNING.
+            logger.warning("%s %s", LOG_TAG, NATIVE_FIX_MESSAGE)
+        return {
+            "Stream.get_stream": False,
+            "Stream.release_stream": False,
+            "ChannelService.initialize_channel": False,
+        }
 
     result = {}
 
@@ -581,6 +622,7 @@ def uninstall():
     if getattr(current, _TAG, False) and "initialize_channel" in _originals:
         ChannelService.initialize_channel = staticmethod(_originals.pop("initialize_channel"))
     _drift_logged.clear()
+    _native_fix_logged.clear()
     logger.info("%s patches reverted", LOG_TAG)
 
 

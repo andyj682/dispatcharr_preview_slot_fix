@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-10-26
+
+Final release. Dispatcharr 0.33.0 fixes this bug itself (Dispatcharr#1773), with
+the same approach as this plugin.
+
+### Changed
+
+- **Installs nothing on Dispatcharr 0.33.0 and later.** It detects Dispatcharr's
+  own fix, logs one warning saying the plugin is no longer needed, and leaves
+  Dispatcharr's code alone. 1.1.0 would install there, since the method
+  signatures didn't change, and replace Dispatcharr's fix with its own records,
+  which the rest of Dispatcharr's code doesn't read.
+- **Check status** on 0.33.0 and later says the plugin is not needed and should
+  be removed, and counts any preview connections left over under its old
+  records.
+- Behavior on Dispatcharr 0.31.0 and 0.32.0 is unchanged.
+
 ## [1.1.0] - 2026-10-08
 
 Required for Dispatcharr 0.32.0. One build supports both 0.31.0 and 0.32.0.
